@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 
 DNA_COMP = str.maketrans("ACGTNacgtn", "TGCANtgcan")
@@ -34,6 +34,15 @@ class GeneFeature:
     end: int
     strand: str
     raw_attrs: Dict[str, str]
+
+
+@dataclass
+class RegionContext:
+    seqid: str
+    region_start: int
+    region_end: int
+    extract_strand: str
+    output_seqid: str
 
 
 class FastaDB:
@@ -158,6 +167,117 @@ def wrap_fasta(seq: str, width: int = 80) -> str:
     return "\n".join(seq[i : i + width] for i in range(0, len(seq), width))
 
 
+def safe_seqid(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.:-]+", "_", value)
+
+
+def overlap(a_start: int, a_end: int, b_start: int, b_end: int) -> Optional[Tuple[int, int]]:
+    s = max(a_start, b_start)
+    e = min(a_end, b_end)
+    if s > e:
+        return None
+    return (s, e)
+
+
+def remap_to_region(start: int, end: int, ctx: RegionContext) -> Tuple[int, int]:
+    if ctx.extract_strand == "-":
+        mapped_start = ctx.region_end - end + 1
+        mapped_end = ctx.region_end - start + 1
+    else:
+        mapped_start = start - ctx.region_start + 1
+        mapped_end = end - ctx.region_start + 1
+    return (mapped_start, mapped_end)
+
+
+def remap_strand(original: str, extract_strand: str) -> str:
+    if original not in {"+", "-"}:
+        return original
+    if extract_strand == "-":
+        return "+" if original == "-" else "-"
+    return original
+
+
+def export_remapped_annotations(
+    gff_path: Path,
+    ctx: RegionContext,
+    feature_types: Set[str],
+    gff_out: Path,
+    bed_out: Path,
+) -> int:
+    out_gff_lines: List[str] = ["##gff-version 3"]
+    out_bed_lines: List[str] = []
+    kept = 0
+
+    with gff_path.open() as fh:
+        for line in fh:
+            if not line or line.startswith("#"):
+                continue
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) < 9:
+                continue
+            seqid, source, feature_type, start, end, score, strand, phase, attrs_txt = fields
+            if seqid != ctx.seqid:
+                continue
+            if feature_types and feature_type not in feature_types:
+                continue
+
+            try:
+                feat_start = int(start)
+                feat_end = int(end)
+            except ValueError:
+                continue
+
+            ov = overlap(feat_start, feat_end, ctx.region_start, ctx.region_end)
+            if ov is None:
+                continue
+
+            clip_start, clip_end = ov
+            mapped_start, mapped_end = remap_to_region(clip_start, clip_end, ctx)
+            mapped_strand = remap_strand(strand, ctx.extract_strand)
+            attrs = parse_attrs(attrs_txt)
+            attr_pairs = [f"{k}={v}" for k, v in attrs.items()]
+            if "orig_coords" not in attrs:
+                attr_pairs.append(f"orig_coords={ctx.seqid}:{clip_start}-{clip_end}")
+            attrs_out = ";".join(attr_pairs) if attr_pairs else "."
+
+            out_gff_lines.append(
+                "\t".join(
+                    [
+                        ctx.output_seqid,
+                        source,
+                        feature_type,
+                        str(mapped_start),
+                        str(mapped_end),
+                        score,
+                        mapped_strand,
+                        phase,
+                        attrs_out,
+                    ]
+                )
+            )
+
+            bed_start = mapped_start - 1
+            bed_end = mapped_end
+            name = attrs.get("Name") or attrs.get("ID") or feature_type
+            out_bed_lines.append(
+                "\t".join(
+                    [
+                        ctx.output_seqid,
+                        str(bed_start),
+                        str(bed_end),
+                        name,
+                        "0",
+                        mapped_strand if mapped_strand in {"+", "-"} else ".",
+                    ]
+                )
+            )
+            kept += 1
+
+    gff_out.write_text("\n".join(out_gff_lines) + "\n")
+    bed_out.write_text("\n".join(out_bed_lines) + ("\n" if out_bed_lines else ""))
+    return kept
+
+
 def export_for_mvista(
     species_inputs: List[SpeciesInput],
     reference_species: str,
@@ -165,6 +285,8 @@ def export_for_mvista(
     upstream: int,
     downstream: int,
     output_dir: Path,
+    export_annotations: bool,
+    annotation_features: Set[str],
 ) -> List[str]:
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -189,6 +311,27 @@ def export_for_mvista(
         sp_fasta.write_text(f">{header}\n{wrap_fasta(seq)}\n")
         log_lines.append(f"Wrote {sp_fasta}")
 
+        if export_annotations:
+            output_seqid = safe_seqid(f"{sp.species}|{sp.gene_id}")
+            ctx = RegionContext(
+                seqid=feature.seqid,
+                region_start=region_start,
+                region_end=region_end,
+                extract_strand=feature.strand,
+                output_seqid=output_seqid,
+            )
+            anno_gff = output_dir / f"{sp.species}.mvista.annotation.gff3"
+            anno_bed = output_dir / f"{sp.species}.mvista.annotation.bed"
+            kept = export_remapped_annotations(
+                gff_path=sp.gff_path,
+                ctx=ctx,
+                feature_types=annotation_features,
+                gff_out=anno_gff,
+                bed_out=anno_bed,
+            )
+            log_lines.append(f"Wrote {anno_gff} ({kept} features)")
+            log_lines.append(f"Wrote {anno_bed} ({kept} features)")
+
     # Reference first to simplify upload order.
     records.sort(key=lambda x: (0 if x[0] == reference_species else 1, x[0]))
 
@@ -201,9 +344,20 @@ def export_for_mvista(
     manifest = output_dir / "mvista_manifest.tsv"
     with manifest.open("w", newline="") as out:
         w = csv.writer(out, delimiter="\t")
-        w.writerow(["species", "gene_id", "fasta", "reference"])
+        w.writerow(["species", "gene_id", "fasta", "annotation_gff3", "annotation_bed", "reference"])
         for sp in species_inputs:
-            w.writerow([sp.species, sp.gene_id, f"{sp.species}.mvista.fa", "yes" if sp.species == reference_species else "no"])
+            anno_gff_name = f"{sp.species}.mvista.annotation.gff3" if export_annotations else ""
+            anno_bed_name = f"{sp.species}.mvista.annotation.bed" if export_annotations else ""
+            w.writerow(
+                [
+                    sp.species,
+                    sp.gene_id,
+                    f"{sp.species}.mvista.fa",
+                    anno_gff_name,
+                    anno_bed_name,
+                    "yes" if sp.species == reference_species else "no",
+                ]
+            )
     log_lines.append(f"Wrote {manifest}")
 
     return log_lines
@@ -275,6 +429,8 @@ class MVistaGui(tk.Tk):
         self.down_var = tk.StringVar(value="500")
         self.ref_var = tk.StringVar()
         self.output_var = tk.StringVar(value=str(Path.cwd() / "mvista_output"))
+        self.export_anno_var = tk.BooleanVar(value=True)
+        self.anno_types_var = tk.StringVar(value="gene,mRNA,transcript,CDS,exon,five_prime_UTR,three_prime_UTR,UTR")
 
         ttk.Label(settings, text="Mode").grid(row=0, column=0, sticky="w")
         ttk.Combobox(
@@ -299,7 +455,13 @@ class MVistaGui(tk.Tk):
         ttk.Entry(settings, textvariable=self.output_var, width=42).grid(row=1, column=4, padx=(0, 4))
         ttk.Button(settings, text="Browse", command=self._pick_output).grid(row=1, column=5, padx=(0, 8))
 
-        ttk.Button(settings, text="Build mVISTA Files", command=self._run).grid(row=1, column=6)
+        ttk.Checkbutton(settings, text="Export remapped annotation", variable=self.export_anno_var).grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(8, 0)
+        )
+        ttk.Label(settings, text="Annotation feature types (comma-separated)").grid(row=2, column=2, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Entry(settings, textvariable=self.anno_types_var, width=52).grid(row=2, column=4, columnspan=2, sticky="we", pady=(8, 0))
+
+        ttk.Button(settings, text="Build mVISTA Files", command=self._run).grid(row=1, column=6, rowspan=2, sticky="ns")
 
         log_box = ttk.LabelFrame(top, text="Log", padding=8)
         log_box.pack(fill="both", expand=True, pady=(8, 0))
@@ -386,6 +548,13 @@ class MVistaGui(tk.Tk):
 
         out_dir = Path(self.output_var.get().strip())
         mode = self.mode_var.get().strip()
+        export_annotations = self.export_anno_var.get()
+        annotation_features: Set[str] = set()
+        if export_annotations:
+            annotation_features = {x.strip() for x in self.anno_types_var.get().split(",") if x.strip()}
+            if not annotation_features:
+                messagebox.showerror("Invalid annotation types", "Specify at least one annotation feature type.")
+                return
 
         try:
             logs = export_for_mvista(
@@ -395,6 +564,8 @@ class MVistaGui(tk.Tk):
                 upstream=upstream,
                 downstream=downstream,
                 output_dir=out_dir,
+                export_annotations=export_annotations,
+                annotation_features=annotation_features,
             )
         except Exception as exc:
             self._append_log(f"ERROR: {exc}")
@@ -405,6 +576,8 @@ class MVistaGui(tk.Tk):
         for line in logs:
             self._append_log(line)
         self._append_log("Tip: Upload reference first in mVISTA, then others (or use multi-FASTA if accepted).")
+        if export_annotations:
+            self._append_log("Tip: Use *.mvista.annotation.gff3 (or .bed) as annotation track for each extracted sequence.")
         messagebox.showinfo("Done", f"mVISTA input files were written to:\n{out_dir}")
 
 
