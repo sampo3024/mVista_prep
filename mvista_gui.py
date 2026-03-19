@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+"""mVISTA input helper GUI.
+
+Builds ortholog-centered regions (promoter or gene+flanks) from genome FASTA + GFF,
+and exports files that can be uploaded to mVISTA web.
+"""
+
+from __future__ import annotations
+
+import csv
+import re
+from dataclasses import dataclass
+from pathlib import Path
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from typing import Dict, List, Optional, Tuple
+
+
+DNA_COMP = str.maketrans("ACGTNacgtn", "TGCANtgcan")
+
+
+@dataclass
+class SpeciesInput:
+    species: str
+    fasta_path: Path
+    gff_path: Path
+    gene_id: str
+
+
+@dataclass
+class GeneFeature:
+    seqid: str
+    start: int
+    end: int
+    strand: str
+    raw_attrs: Dict[str, str]
+
+
+class FastaDB:
+    def __init__(self, path: Path):
+        self.path = path
+        self.records: Dict[str, str] = {}
+        self._load()
+
+    def _load(self) -> None:
+        current = None
+        chunks: List[str] = []
+        with self.path.open() as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith(">"):
+                    if current is not None:
+                        self.records[current] = "".join(chunks)
+                    current = line[1:].split()[0]
+                    chunks = []
+                else:
+                    chunks.append(line)
+            if current is not None:
+                self.records[current] = "".join(chunks)
+
+    def get_subseq(self, seqid: str, start: int, end: int, strand: str) -> str:
+        if seqid not in self.records:
+            raise KeyError(f"Sequence ID '{seqid}' not found in {self.path}")
+        seq = self.records[seqid]
+        left = max(1, start)
+        right = min(len(seq), end)
+        if left > right:
+            return ""
+        out = seq[left - 1 : right]
+        if strand == "-":
+            out = out.translate(DNA_COMP)[::-1]
+        return out
+
+
+ATTR_DELIMS = re.compile(r"\s*;\s*")
+
+
+def parse_attrs(attr_text: str) -> Dict[str, str]:
+    attrs: Dict[str, str] = {}
+    for pair in ATTR_DELIMS.split(attr_text.strip(";")):
+        if not pair:
+            continue
+        if "=" in pair:
+            key, value = pair.split("=", 1)
+        elif " " in pair:
+            key, value = pair.split(" ", 1)
+            value = value.strip().strip('"')
+        else:
+            continue
+        attrs[key.strip()] = value.strip()
+    return attrs
+
+
+def match_gene(attrs: Dict[str, str], target_gene: str) -> bool:
+    target = target_gene.strip()
+    keys = ["ID", "Name", "gene", "gene_id", "locus_tag", "transcript_id"]
+    for key in keys:
+        value = attrs.get(key)
+        if value and value == target:
+            return True
+    return False
+
+
+def find_gene_feature(gff_path: Path, gene_id: str) -> GeneFeature:
+    best: Optional[GeneFeature] = None
+    with gff_path.open() as fh:
+        for line in fh:
+            if not line or line.startswith("#"):
+                continue
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) < 9:
+                continue
+            seqid, _source, feature_type, start, end, _score, strand, _phase, attrs_txt = fields
+            attrs = parse_attrs(attrs_txt)
+            if not match_gene(attrs, gene_id):
+                continue
+            if feature_type not in {"gene", "mRNA", "transcript", "CDS", "exon"}:
+                continue
+            feat = GeneFeature(
+                seqid=seqid,
+                start=int(start),
+                end=int(end),
+                strand=strand,
+                raw_attrs=attrs,
+            )
+            # Prefer "gene" over other feature types.
+            if feature_type == "gene":
+                return feat
+            if best is None:
+                best = feat
+    if best is not None:
+        return best
+    raise ValueError(f"Gene '{gene_id}' not found in {gff_path}")
+
+
+def region_for_feature(feature: GeneFeature, mode: str, upstream: int, downstream: int) -> Tuple[int, int]:
+    if mode == "Promoter (upstream from TSS)":
+        if feature.strand == "-":
+            start = feature.end + 1
+            end = feature.end + upstream
+        else:
+            start = feature.start - upstream
+            end = feature.start - 1
+    else:
+        # Gene body + flanks.
+        if feature.strand == "-":
+            start = feature.start - downstream
+            end = feature.end + upstream
+        else:
+            start = feature.start - upstream
+            end = feature.end + downstream
+    return (max(1, start), max(1, end))
+
+
+def wrap_fasta(seq: str, width: int = 80) -> str:
+    return "\n".join(seq[i : i + width] for i in range(0, len(seq), width))
+
+
+def export_for_mvista(
+    species_inputs: List[SpeciesInput],
+    reference_species: str,
+    mode: str,
+    upstream: int,
+    downstream: int,
+    output_dir: Path,
+) -> List[str]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    records: List[Tuple[str, str, str, int, int, str]] = []
+    log_lines: List[str] = []
+
+    for sp in species_inputs:
+        feature = find_gene_feature(sp.gff_path, sp.gene_id)
+        region_start, region_end = region_for_feature(feature, mode, upstream, downstream)
+
+        fasta = FastaDB(sp.fasta_path)
+        seq = fasta.get_subseq(feature.seqid, region_start, region_end, feature.strand)
+        if not seq:
+            raise ValueError(
+                f"Extracted sequence length is 0: species={sp.species}, region={feature.seqid}:{region_start}-{region_end}"
+            )
+
+        header = f"{sp.species}|{sp.gene_id}|{feature.seqid}:{region_start}-{region_end}({feature.strand})"
+        records.append((sp.species, header, seq, region_start, region_end, feature.strand))
+
+        sp_fasta = output_dir / f"{sp.species}.mvista.fa"
+        sp_fasta.write_text(f">{header}\n{wrap_fasta(seq)}\n")
+        log_lines.append(f"Wrote {sp_fasta}")
+
+    # Reference first to simplify upload order.
+    records.sort(key=lambda x: (0 if x[0] == reference_species else 1, x[0]))
+
+    multi_fa = output_dir / "mvista_regions.multi.fa"
+    with multi_fa.open("w") as out:
+        for _sp, header, seq, *_rest in records:
+            out.write(f">{header}\n{wrap_fasta(seq)}\n")
+    log_lines.append(f"Wrote {multi_fa}")
+
+    manifest = output_dir / "mvista_manifest.tsv"
+    with manifest.open("w", newline="") as out:
+        w = csv.writer(out, delimiter="\t")
+        w.writerow(["species", "gene_id", "fasta", "reference"])
+        for sp in species_inputs:
+            w.writerow([sp.species, sp.gene_id, f"{sp.species}.mvista.fa", "yes" if sp.species == reference_species else "no"])
+    log_lines.append(f"Wrote {manifest}")
+
+    return log_lines
+
+
+class MVistaGui(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("mVISTA Ortholog Region Builder")
+        self.geometry("1080x640")
+
+        self.species_rows: List[SpeciesInput] = []
+
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        top = ttk.Frame(self, padding=10)
+        top.pack(fill="both", expand=True)
+
+        table_frame = ttk.LabelFrame(top, text="Species Inputs", padding=8)
+        table_frame.pack(fill="both", expand=True)
+
+        cols = ("species", "fasta", "gff", "gene")
+        self.tree = ttk.Treeview(table_frame, columns=cols, show="headings", height=12)
+        self.tree.heading("species", text="Species")
+        self.tree.heading("fasta", text="Genome FASTA")
+        self.tree.heading("gff", text="GFF/GTF")
+        self.tree.heading("gene", text="Ortholog Gene ID")
+        self.tree.column("species", width=140)
+        self.tree.column("fasta", width=320)
+        self.tree.column("gff", width=320)
+        self.tree.column("gene", width=180)
+        self.tree.pack(side="left", fill="both", expand=True)
+
+        yscroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=yscroll.set)
+        yscroll.pack(side="right", fill="y")
+
+        form = ttk.Frame(top, padding=(0, 8))
+        form.pack(fill="x")
+
+        self.species_var = tk.StringVar()
+        self.fasta_var = tk.StringVar()
+        self.gff_var = tk.StringVar()
+        self.gene_var = tk.StringVar()
+
+        ttk.Label(form, text="Species").grid(row=0, column=0, sticky="w")
+        ttk.Entry(form, textvariable=self.species_var, width=18).grid(row=1, column=0, padx=(0, 8))
+
+        ttk.Label(form, text="Genome FASTA").grid(row=0, column=1, sticky="w")
+        ttk.Entry(form, textvariable=self.fasta_var, width=36).grid(row=1, column=1, padx=(0, 4))
+        ttk.Button(form, text="Browse", command=self._pick_fasta).grid(row=1, column=2, padx=(0, 8))
+
+        ttk.Label(form, text="GFF/GTF").grid(row=0, column=3, sticky="w")
+        ttk.Entry(form, textvariable=self.gff_var, width=36).grid(row=1, column=3, padx=(0, 4))
+        ttk.Button(form, text="Browse", command=self._pick_gff).grid(row=1, column=4, padx=(0, 8))
+
+        ttk.Label(form, text="Ortholog Gene ID").grid(row=0, column=5, sticky="w")
+        ttk.Entry(form, textvariable=self.gene_var, width=20).grid(row=1, column=5, padx=(0, 8))
+
+        ttk.Button(form, text="Add Row", command=self._add_row).grid(row=1, column=6, padx=(0, 6))
+        ttk.Button(form, text="Remove Selected", command=self._remove_selected).grid(row=1, column=7)
+
+        settings = ttk.LabelFrame(top, text="Extraction Settings", padding=8)
+        settings.pack(fill="x", pady=(8, 0))
+
+        self.mode_var = tk.StringVar(value="Promoter (upstream from TSS)")
+        self.up_var = tk.StringVar(value="2000")
+        self.down_var = tk.StringVar(value="500")
+        self.ref_var = tk.StringVar()
+        self.output_var = tk.StringVar(value=str(Path.cwd() / "mvista_output"))
+
+        ttk.Label(settings, text="Mode").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(
+            settings,
+            textvariable=self.mode_var,
+            values=["Promoter (upstream from TSS)", "Gene body + flanks"],
+            state="readonly",
+            width=28,
+        ).grid(row=1, column=0, padx=(0, 8))
+
+        ttk.Label(settings, text="Upstream bp").grid(row=0, column=1, sticky="w")
+        ttk.Entry(settings, textvariable=self.up_var, width=10).grid(row=1, column=1, padx=(0, 8))
+
+        ttk.Label(settings, text="Downstream bp").grid(row=0, column=2, sticky="w")
+        ttk.Entry(settings, textvariable=self.down_var, width=10).grid(row=1, column=2, padx=(0, 8))
+
+        ttk.Label(settings, text="Reference species").grid(row=0, column=3, sticky="w")
+        self.ref_combo = ttk.Combobox(settings, textvariable=self.ref_var, state="readonly", width=18)
+        self.ref_combo.grid(row=1, column=3, padx=(0, 8))
+
+        ttk.Label(settings, text="Output dir").grid(row=0, column=4, sticky="w")
+        ttk.Entry(settings, textvariable=self.output_var, width=42).grid(row=1, column=4, padx=(0, 4))
+        ttk.Button(settings, text="Browse", command=self._pick_output).grid(row=1, column=5, padx=(0, 8))
+
+        ttk.Button(settings, text="Build mVISTA Files", command=self._run).grid(row=1, column=6)
+
+        log_box = ttk.LabelFrame(top, text="Log", padding=8)
+        log_box.pack(fill="both", expand=True, pady=(8, 0))
+        self.log = tk.Text(log_box, height=10)
+        self.log.pack(fill="both", expand=True)
+
+    def _pick_fasta(self) -> None:
+        p = filedialog.askopenfilename(filetypes=[("FASTA", "*.fa *.fasta *.fna"), ("All files", "*")])
+        if p:
+            self.fasta_var.set(p)
+
+    def _pick_gff(self) -> None:
+        p = filedialog.askopenfilename(filetypes=[("GFF/GTF", "*.gff *.gff3 *.gtf"), ("All files", "*")])
+        if p:
+            self.gff_var.set(p)
+
+    def _pick_output(self) -> None:
+        p = filedialog.askdirectory()
+        if p:
+            self.output_var.set(p)
+
+    def _append_log(self, msg: str) -> None:
+        self.log.insert("end", msg + "\n")
+        self.log.see("end")
+
+    def _refresh_reference_options(self) -> None:
+        names = [r.species for r in self.species_rows]
+        self.ref_combo["values"] = names
+        if names and self.ref_var.get() not in names:
+            self.ref_var.set(names[0])
+        if not names:
+            self.ref_var.set("")
+
+    def _add_row(self) -> None:
+        species = self.species_var.get().strip()
+        fasta = self.fasta_var.get().strip()
+        gff = self.gff_var.get().strip()
+        gene = self.gene_var.get().strip()
+
+        if not all([species, fasta, gff, gene]):
+            messagebox.showerror("Missing fields", "Species, FASTA, GFF/GTF, and Gene ID are required.")
+            return
+
+        row = SpeciesInput(species=species, fasta_path=Path(fasta), gff_path=Path(gff), gene_id=gene)
+        self.species_rows.append(row)
+        self.tree.insert("", "end", values=(species, fasta, gff, gene))
+        self._refresh_reference_options()
+
+        self.species_var.set("")
+        self.fasta_var.set("")
+        self.gff_var.set("")
+        self.gene_var.set("")
+
+    def _remove_selected(self) -> None:
+        selected = self.tree.selection()
+        if not selected:
+            return
+
+        idxs = sorted((self.tree.index(item) for item in selected), reverse=True)
+        for idx in idxs:
+            self.species_rows.pop(idx)
+        for item in selected:
+            self.tree.delete(item)
+        self._refresh_reference_options()
+
+    def _run(self) -> None:
+        if len(self.species_rows) < 2:
+            messagebox.showerror("Need multiple species", "Add at least 2 species for conservation comparison.")
+            return
+
+        ref = self.ref_var.get().strip()
+        if not ref:
+            messagebox.showerror("Missing reference", "Select a reference species.")
+            return
+
+        try:
+            upstream = int(self.up_var.get().strip())
+            downstream = int(self.down_var.get().strip())
+            if upstream < 0 or downstream < 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid length", "Upstream/Downstream must be non-negative integers.")
+            return
+
+        out_dir = Path(self.output_var.get().strip())
+        mode = self.mode_var.get().strip()
+
+        try:
+            logs = export_for_mvista(
+                species_inputs=self.species_rows,
+                reference_species=ref,
+                mode=mode,
+                upstream=upstream,
+                downstream=downstream,
+                output_dir=out_dir,
+            )
+        except Exception as exc:
+            self._append_log(f"ERROR: {exc}")
+            messagebox.showerror("Build failed", str(exc))
+            return
+
+        self._append_log("Build completed.")
+        for line in logs:
+            self._append_log(line)
+        self._append_log("Tip: Upload reference first in mVISTA, then others (or use multi-FASTA if accepted).")
+        messagebox.showinfo("Done", f"mVISTA input files were written to:\n{out_dir}")
+
+
+def main() -> None:
+    app = MVistaGui()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
