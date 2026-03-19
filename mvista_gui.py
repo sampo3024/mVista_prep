@@ -45,6 +45,19 @@ class RegionContext:
     output_seqid: str
 
 
+@dataclass
+class GffRecord:
+    seqid: str
+    source: str
+    feature_type: str
+    start: int
+    end: int
+    score: str
+    strand: str
+    phase: str
+    attrs: Dict[str, str]
+
+
 class FastaDB:
     def __init__(self, path: Path):
         self.path = path
@@ -197,6 +210,52 @@ def remap_strand(original: str, extract_strand: str) -> str:
     return original
 
 
+def parse_gff_records(gff_path: Path, seqid_filter: str) -> List[GffRecord]:
+    records: List[GffRecord] = []
+    with gff_path.open() as fh:
+        for line in fh:
+            if not line or line.startswith("#"):
+                continue
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) < 9:
+                continue
+            seqid, source, feature_type, start, end, score, strand, phase, attrs_txt = fields
+            if seqid != seqid_filter:
+                continue
+            try:
+                feat_start = int(start)
+                feat_end = int(end)
+            except ValueError:
+                continue
+            records.append(
+                GffRecord(
+                    seqid=seqid,
+                    source=source,
+                    feature_type=feature_type,
+                    start=feat_start,
+                    end=feat_end,
+                    score=score,
+                    strand=strand,
+                    phase=phase,
+                    attrs=parse_attrs(attrs_txt),
+                )
+            )
+    return records
+
+
+def normalize_child_type(feature_type: str) -> Optional[str]:
+    ft = feature_type.lower()
+    if ft == "exon":
+        return "exon"
+    if ft in {"utr", "five_prime_utr", "three_prime_utr"}:
+        return "utr"
+    return None
+
+
+def record_name(rec: GffRecord) -> str:
+    return rec.attrs.get("Name") or rec.attrs.get("gene") or rec.attrs.get("ID") or "gene"
+
+
 def export_remapped_annotations(
     gff_path: Path,
     ctx: RegionContext,
@@ -278,6 +337,71 @@ def export_remapped_annotations(
     return kept
 
 
+def export_mvista_simple_annotation(gff_path: Path, ctx: RegionContext, out_path: Path) -> int:
+    records = parse_gff_records(gff_path, ctx.seqid)
+    gene_like = {"gene", "mrna", "transcript"}
+    children_by_parent: Dict[str, List[GffRecord]] = {}
+    in_region: List[GffRecord] = []
+
+    for rec in records:
+        if overlap(rec.start, rec.end, ctx.region_start, ctx.region_end) is not None:
+            in_region.append(rec)
+        parents = rec.attrs.get("Parent", "")
+        if parents:
+            for parent in [x.strip() for x in parents.split(",") if x.strip()]:
+                children_by_parent.setdefault(parent, []).append(rec)
+
+    lines: List[str] = []
+    genes_written = 0
+    gene_records = [r for r in in_region if r.feature_type.lower() in gene_like]
+    gene_records.sort(key=lambda r: (r.start, r.end))
+
+    for gene in gene_records:
+        ov = overlap(gene.start, gene.end, ctx.region_start, ctx.region_end)
+        if ov is None:
+            continue
+        clip_start, clip_end = ov
+        gstart, gend = remap_to_region(clip_start, clip_end, ctx)
+        gstrand = remap_strand(gene.strand, ctx.extract_strand)
+        sign = ">" if gstrand != "-" else "<"
+        lines.append(f"{sign} {gstart} {gend} {record_name(gene)}")
+        genes_written += 1
+
+        # Traverse descendants and emit exon/utr entries.
+        seed_ids = []
+        if gene.attrs.get("ID"):
+            seed_ids.append(gene.attrs["ID"])
+        stack = list(seed_ids)
+        seen: Set[str] = set()
+        child_entries: List[Tuple[int, int, str]] = []
+
+        while stack:
+            parent_id = stack.pop()
+            if parent_id in seen:
+                continue
+            seen.add(parent_id)
+            for child in children_by_parent.get(parent_id, []):
+                child_id = child.attrs.get("ID")
+                if child_id:
+                    stack.append(child_id)
+                ctype = normalize_child_type(child.feature_type)
+                if ctype is None:
+                    continue
+                cov = overlap(child.start, child.end, ctx.region_start, ctx.region_end)
+                if cov is None:
+                    continue
+                cstart, cend = remap_to_region(cov[0], cov[1], ctx)
+                child_entries.append((cstart, cend, ctype))
+
+        child_entries.sort(key=lambda x: (x[0], x[1], x[2]))
+        for cstart, cend, ctype in child_entries:
+            lines.append(f"{cstart} {cend} {ctype}")
+        lines.append("")
+
+    out_path.write_text("\n".join(lines).rstrip() + ("\n" if lines else ""))
+    return genes_written
+
+
 def export_for_mvista(
     species_inputs: List[SpeciesInput],
     reference_species: str,
@@ -322,6 +446,7 @@ def export_for_mvista(
             )
             anno_gff = output_dir / f"{sp.species}.mvista.annotation.gff3"
             anno_bed = output_dir / f"{sp.species}.mvista.annotation.bed"
+            anno_txt = output_dir / f"{sp.species}.mvista.annotation.txt"
             kept = export_remapped_annotations(
                 gff_path=sp.gff_path,
                 ctx=ctx,
@@ -329,6 +454,12 @@ def export_for_mvista(
                 gff_out=anno_gff,
                 bed_out=anno_bed,
             )
+            genes_written = export_mvista_simple_annotation(
+                gff_path=sp.gff_path,
+                ctx=ctx,
+                out_path=anno_txt,
+            )
+            log_lines.append(f"Wrote {anno_txt} ({genes_written} genes)")
             log_lines.append(f"Wrote {anno_gff} ({kept} features)")
             log_lines.append(f"Wrote {anno_bed} ({kept} features)")
 
@@ -344,8 +475,9 @@ def export_for_mvista(
     manifest = output_dir / "mvista_manifest.tsv"
     with manifest.open("w", newline="") as out:
         w = csv.writer(out, delimiter="\t")
-        w.writerow(["species", "gene_id", "fasta", "annotation_gff3", "annotation_bed", "reference"])
+        w.writerow(["species", "gene_id", "fasta", "annotation_txt", "annotation_gff3", "annotation_bed", "reference"])
         for sp in species_inputs:
+            anno_txt_name = f"{sp.species}.mvista.annotation.txt" if export_annotations else ""
             anno_gff_name = f"{sp.species}.mvista.annotation.gff3" if export_annotations else ""
             anno_bed_name = f"{sp.species}.mvista.annotation.bed" if export_annotations else ""
             w.writerow(
@@ -353,6 +485,7 @@ def export_for_mvista(
                     sp.species,
                     sp.gene_id,
                     f"{sp.species}.mvista.fa",
+                    anno_txt_name,
                     anno_gff_name,
                     anno_bed_name,
                     "yes" if sp.species == reference_species else "no",
@@ -577,7 +710,7 @@ class MVistaGui(tk.Tk):
             self._append_log(line)
         self._append_log("Tip: Upload reference first in mVISTA, then others (or use multi-FASTA if accepted).")
         if export_annotations:
-            self._append_log("Tip: Use *.mvista.annotation.gff3 (or .bed) as annotation track for each extracted sequence.")
+            self._append_log("Tip: For mVISTA plain-text annotation, use *.mvista.annotation.txt for each extracted sequence.")
         messagebox.showinfo("Done", f"mVISTA input files were written to:\n{out_dir}")
 
 
