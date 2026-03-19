@@ -256,6 +256,49 @@ def record_name(rec: GffRecord) -> str:
     return rec.attrs.get("Name") or rec.attrs.get("gene") or rec.attrs.get("ID") or "gene"
 
 
+def infer_group_id(rec: GffRecord) -> Optional[str]:
+    parents = rec.attrs.get("Parent", "")
+    parent_first = ""
+    if parents:
+        parent_first = [x.strip() for x in parents.split(",") if x.strip()][0]
+    return (
+        rec.attrs.get("gene_id")
+        or rec.attrs.get("gene")
+        or rec.attrs.get("locus_tag")
+        or parent_first
+        or rec.attrs.get("transcript_id")
+        or rec.attrs.get("ID")
+    )
+
+
+def gene_id_candidates(rec: GffRecord) -> Set[str]:
+    keys = ["ID", "Name", "gene", "gene_id", "locus_tag", "transcript_id"]
+    return {rec.attrs[k] for k in keys if rec.attrs.get(k)}
+
+
+def child_belongs_to_gene(child: GffRecord, gene_ids: Set[str]) -> bool:
+    parents = {x.strip() for x in child.attrs.get("Parent", "").split(",") if x.strip()}
+    if parents & gene_ids:
+        return True
+    for key in ["gene_id", "gene", "locus_tag", "transcript_id", "ID", "Name"]:
+        v = child.attrs.get(key)
+        if v and v in gene_ids:
+            return True
+    return False
+
+
+def count_region_records(records: List[GffRecord], ctx: RegionContext) -> Tuple[int, int]:
+    total = 0
+    child_like = 0
+    for rec in records:
+        if overlap(rec.start, rec.end, ctx.region_start, ctx.region_end) is None:
+            continue
+        total += 1
+        if normalize_child_type(rec.feature_type) is not None:
+            child_like += 1
+    return total, child_like
+
+
 def export_remapped_annotations(
     gff_path: Path,
     ctx: RegionContext,
@@ -277,7 +320,7 @@ def export_remapped_annotations(
             seqid, source, feature_type, start, end, score, strand, phase, attrs_txt = fields
             if seqid != ctx.seqid:
                 continue
-            if feature_types and feature_type not in feature_types:
+            if feature_types and feature_type.lower() not in feature_types:
                 continue
 
             try:
@@ -340,63 +383,85 @@ def export_remapped_annotations(
 def export_mvista_simple_annotation(gff_path: Path, ctx: RegionContext, out_path: Path) -> int:
     records = parse_gff_records(gff_path, ctx.seqid)
     gene_like = {"gene", "mrna", "transcript"}
-    children_by_parent: Dict[str, List[GffRecord]] = {}
     in_region: List[GffRecord] = []
 
     for rec in records:
         if overlap(rec.start, rec.end, ctx.region_start, ctx.region_end) is not None:
             in_region.append(rec)
-        parents = rec.attrs.get("Parent", "")
-        if parents:
-            for parent in [x.strip() for x in parents.split(",") if x.strip()]:
-                children_by_parent.setdefault(parent, []).append(rec)
 
     lines: List[str] = []
     genes_written = 0
     gene_records = [r for r in in_region if r.feature_type.lower() in gene_like]
     gene_records.sort(key=lambda r: (r.start, r.end))
+    child_records = [r for r in in_region if normalize_child_type(r.feature_type) is not None]
 
-    for gene in gene_records:
-        ov = overlap(gene.start, gene.end, ctx.region_start, ctx.region_end)
-        if ov is None:
-            continue
-        clip_start, clip_end = ov
-        gstart, gend = remap_to_region(clip_start, clip_end, ctx)
-        gstrand = remap_strand(gene.strand, ctx.extract_strand)
-        sign = ">" if gstrand != "-" else "<"
-        lines.append(f"{sign} {gstart} {gend} {record_name(gene)}")
-        genes_written += 1
-
-        # Traverse descendants and emit exon/utr entries.
-        seed_ids = []
-        if gene.attrs.get("ID"):
-            seed_ids.append(gene.attrs["ID"])
-        stack = list(seed_ids)
-        seen: Set[str] = set()
-        child_entries: List[Tuple[int, int, str]] = []
-
-        while stack:
-            parent_id = stack.pop()
-            if parent_id in seen:
+    if gene_records:
+        for gene in gene_records:
+            ov = overlap(gene.start, gene.end, ctx.region_start, ctx.region_end)
+            if ov is None:
                 continue
-            seen.add(parent_id)
-            for child in children_by_parent.get(parent_id, []):
-                child_id = child.attrs.get("ID")
-                if child_id:
-                    stack.append(child_id)
-                ctype = normalize_child_type(child.feature_type)
-                if ctype is None:
+            clip_start, clip_end = ov
+            gstart, gend = remap_to_region(clip_start, clip_end, ctx)
+            gstrand = remap_strand(gene.strand, ctx.extract_strand)
+            sign = ">" if gstrand != "-" else "<"
+            lines.append(f"{sign} {gstart} {gend} {record_name(gene)}")
+            genes_written += 1
+
+            ids = gene_id_candidates(gene)
+            child_entries: List[Tuple[int, int, str]] = []
+            for child in child_records:
+                if not child_belongs_to_gene(child, ids):
                     continue
                 cov = overlap(child.start, child.end, ctx.region_start, ctx.region_end)
                 if cov is None:
                     continue
+                ctype = normalize_child_type(child.feature_type)
+                if ctype is None:
+                    continue
                 cstart, cend = remap_to_region(cov[0], cov[1], ctx)
                 child_entries.append((cstart, cend, ctype))
 
-        child_entries.sort(key=lambda x: (x[0], x[1], x[2]))
-        for cstart, cend, ctype in child_entries:
-            lines.append(f"{cstart} {cend} {ctype}")
-        lines.append("")
+            child_entries.sort(key=lambda x: (x[0], x[1], x[2]))
+            for cstart, cend, ctype in child_entries:
+                lines.append(f"{cstart} {cend} {ctype}")
+            lines.append("")
+    else:
+        # Fallback for GTF-like data with no explicit gene/transcript rows:
+        # group exon/UTR records by gene_id/locus_tag/Parent and emit pseudo-gene blocks.
+        grouped: Dict[str, List[GffRecord]] = {}
+        for child in child_records:
+            gid = infer_group_id(child)
+            if gid:
+                grouped.setdefault(gid, []).append(child)
+
+        ordered_groups = sorted(grouped.items(), key=lambda kv: min(r.start for r in kv[1]))
+        for gid, group in ordered_groups:
+            min_s = min(r.start for r in group)
+            max_e = max(r.end for r in group)
+            gov = overlap(min_s, max_e, ctx.region_start, ctx.region_end)
+            if gov is None:
+                continue
+            gstart, gend = remap_to_region(gov[0], gov[1], ctx)
+            strand0 = group[0].strand if group else "."
+            gstrand = remap_strand(strand0, ctx.extract_strand)
+            sign = ">" if gstrand != "-" else "<"
+            lines.append(f"{sign} {gstart} {gend} {gid}")
+            genes_written += 1
+
+            child_entries: List[Tuple[int, int, str]] = []
+            for child in group:
+                cov = overlap(child.start, child.end, ctx.region_start, ctx.region_end)
+                if cov is None:
+                    continue
+                ctype = normalize_child_type(child.feature_type)
+                if ctype is None:
+                    continue
+                cstart, cend = remap_to_region(cov[0], cov[1], ctx)
+                child_entries.append((cstart, cend, ctype))
+            child_entries.sort(key=lambda x: (x[0], x[1], x[2]))
+            for cstart, cend, ctype in child_entries:
+                lines.append(f"{cstart} {cend} {ctype}")
+            lines.append("")
 
     out_path.write_text("\n".join(lines).rstrip() + ("\n" if lines else ""))
     return genes_written
@@ -447,6 +512,8 @@ def export_for_mvista(
             anno_gff = output_dir / f"{sp.species}.mvista.annotation.gff3"
             anno_bed = output_dir / f"{sp.species}.mvista.annotation.bed"
             anno_txt = output_dir / f"{sp.species}.mvista.annotation.txt"
+            gff_records = parse_gff_records(sp.gff_path, feature.seqid)
+            region_total, region_child = count_region_records(gff_records, ctx)
             kept = export_remapped_annotations(
                 gff_path=sp.gff_path,
                 ctx=ctx,
@@ -458,6 +525,9 @@ def export_for_mvista(
                 gff_path=sp.gff_path,
                 ctx=ctx,
                 out_path=anno_txt,
+            )
+            log_lines.append(
+                f"Annotation debug: seqid={feature.seqid}, region_records={region_total}, child_like_records={region_child}"
             )
             log_lines.append(f"Wrote {anno_txt} ({genes_written} genes)")
             log_lines.append(f"Wrote {anno_gff} ({kept} features)")
@@ -684,7 +754,7 @@ class MVistaGui(tk.Tk):
         export_annotations = self.export_anno_var.get()
         annotation_features: Set[str] = set()
         if export_annotations:
-            annotation_features = {x.strip() for x in self.anno_types_var.get().split(",") if x.strip()}
+            annotation_features = {x.strip().lower() for x in self.anno_types_var.get().split(",") if x.strip()}
             if not annotation_features:
                 messagebox.showerror("Invalid annotation types", "Specify at least one annotation feature type.")
                 return
